@@ -4,6 +4,7 @@
   var page = body.dataset.page;
   var api = new URL(body.dataset.gameApi || "game-api", document.baseURI)
     .href.replace(/\/+$/, "");
+  var sameOriginApi = new URL("game-api", document.baseURI).href.replace(/\/+$/, "");
   var room = body.dataset.room;
   var statusNode = document.getElementById("status");
   var currentView = null;
@@ -62,6 +63,16 @@
           throw new Error(value.message || value.code || "Request failed");
         }
         return value;
+      });
+    });
+  }
+  function requestWithoutResponse(url, options) {
+    return fetch(sameOriginApi + url, options).then(function (response) {
+      if (response.ok) return;
+      return response.json().then(function (value) {
+        throw new Error(value.message || value.code || "Request failed");
+      }, function () {
+        throw new Error("Request failed");
       });
     });
   }
@@ -247,6 +258,25 @@
   }
 
   if (page === "lobby") {
+    Array.prototype.forEach.call(document.querySelectorAll("[data-delete-room]"), function (button) {
+      button.onclick = function () {
+        var roomName = button.dataset.room;
+        if (!window.confirm('Remove room "' + roomName + '"?')) return;
+        button.disabled = true;
+        status('Removing room "' + roomName + '"…');
+        requestWithoutResponse("/api/rooms/" + encodeURIComponent(roomName), {method:"DELETE"})
+          .then(function () {
+            var row = button.closest("li");
+            if (row) row.remove();
+            else window.location.reload();
+            status('Removed room "' + roomName + '".');
+          })
+          .catch(function (error) {
+            button.disabled = false;
+            status(errorText(error, "Could not remove the room."));
+          });
+      };
+    });
     document.getElementById("create-room").onsubmit = function (event) {
       event.preventDefault();
       var form = event.target;

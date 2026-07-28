@@ -1,10 +1,15 @@
-use std::{env, fmt::Write as _, sync::Arc};
+use std::{
+    env,
+    fmt::Write as _,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     Router,
     body::{Body, Bytes},
     extract::{
-        OriginalUri, Path, State,
+        ConnectInfo, OriginalUri, Path, State,
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, Method, StatusCode, header},
@@ -57,11 +62,16 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     eprintln!("web-server listening on http://{listen}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
 async fn proxy_http(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     method: Method,
     OriginalUri(uri): OriginalUri,
@@ -71,6 +81,9 @@ async fn proxy_http(
     let Some(path) = uri.path().strip_prefix("/game-api") else {
         return proxy_error("Invalid game API proxy path");
     };
+    if is_room_delete(&method, path) && !request_is_local(peer, &headers) {
+        return local_only_error();
+    }
     let mut upstream_url = format!("{}{path}", state.game_internal.trim_end_matches('/'));
     if let Some(query) = uri.query() {
         upstream_url.push('?');
@@ -246,7 +259,95 @@ fn proxy_error(message: &str) -> Response {
         .into_response()
 }
 
-async fn lobby(State(state): State<Arc<AppState>>) -> Html<String> {
+fn local_only_error() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        serde_json::json!({
+            "type": "error",
+            "code": "local_only",
+            "message": "Room removal is only available from localhost",
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+fn is_room_delete(method: &Method, path: &str) -> bool {
+    if method != Method::DELETE {
+        return false;
+    }
+    path.strip_prefix("/api/rooms/")
+        .is_some_and(|room| !room.is_empty() && !room.contains('/'))
+}
+
+fn request_is_local(peer: SocketAddr, headers: &HeaderMap) -> bool {
+    address_is_loopback(peer.ip())
+        && plain_forwarded_header_is_local(headers, "x-forwarded-for")
+        && plain_forwarded_header_is_local(headers, "x-real-ip")
+        && forwarded_header_is_local(headers)
+}
+
+fn plain_forwarded_header_is_local(headers: &HeaderMap, name: &str) -> bool {
+    headers.get_all(name).iter().all(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .all(|part| parse_forwarded_address(part).is_some_and(address_is_loopback))
+        })
+    })
+}
+
+fn forwarded_header_is_local(headers: &HeaderMap) -> bool {
+    headers.get_all("forwarded").iter().all(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').all(|element| {
+                element.split(';').all(|parameter| {
+                    let Some((name, value)) = parameter.split_once('=') else {
+                        return true;
+                    };
+                    !name.trim().eq_ignore_ascii_case("for")
+                        || parse_forwarded_address(value).is_some_and(address_is_loopback)
+                })
+            })
+        })
+    })
+}
+
+fn parse_forwarded_address(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    let value = if value.starts_with('"') || value.ends_with('"') {
+        value.strip_prefix('"')?.strip_suffix('"')?
+    } else {
+        value
+    };
+    if let Some(value) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        return value.parse().ok();
+    }
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|address| address.ip()))
+}
+
+fn address_is_loopback(address: IpAddr) -> bool {
+    address.is_loopback()
+        || match address {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .is_some_and(|address| address.is_loopback()),
+            IpAddr::V4(_) => false,
+        }
+}
+
+async fn lobby(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Html<String> {
     let rooms = match state
         .client
         .get(format!("{}/api/rooms", state.game_internal))
@@ -259,18 +360,7 @@ async fn lobby(State(state): State<Arc<AppState>>) -> Html<String> {
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let mut room_rows = String::new();
-    for room in &rooms {
-        write!(
-            room_rows,
-            "<li><a href=\"room/{url}\">{name}</a> — {count}/3 — {lifecycle:?}</li>",
-            url = urlencoding::encode(&room.name),
-            name = escape(&room.name),
-            count = room.seats.len(),
-            lifecycle = room.lifecycle,
-        )
-        .expect("writing HTML to a String cannot fail");
-    }
+    let room_rows = room_rows_markup(&rooms, request_is_local(peer, &headers));
     Html(format!(
         "{head}<body data-page=\"lobby\" data-game-api=\"{api}\">
         <main class=\"lobby\"><h1>♠ Mille · Tysiąc · Tausend ♥</h1>
@@ -291,6 +381,31 @@ async fn lobby(State(state): State<Arc<AppState>>) -> Html<String> {
         api = escape_attr(&state.game_public),
         scripts = scripts(),
     ))
+}
+
+fn room_rows_markup(rooms: &[RoomSummary], allow_removal: bool) -> String {
+    let mut room_rows = String::new();
+    for room in rooms {
+        let remove = if allow_removal {
+            format!(
+                " <button type=\"button\" data-delete-room data-room=\"{room}\" aria-label=\"Remove room {room}\" title=\"Remove room\">×</button>",
+                room = escape_attr(&room.name),
+            )
+        } else {
+            String::new()
+        };
+        write!(
+            room_rows,
+            "<li><a href=\"room/{url}\">{name}</a> — {count}/3 — {lifecycle:?}{remove}</li>",
+            url = urlencoding::encode(&room.name),
+            name = escape(&room.name),
+            count = room.seats.len(),
+            lifecycle = room.lifecycle,
+            remove = remove,
+        )
+        .expect("writing HTML to a String cannot fail");
+    }
+    room_rows
 }
 
 async fn observer(State(state): State<Arc<AppState>>, Path(room): Path<String>) -> Response {
@@ -590,5 +705,66 @@ mod tests {
             Some("ws://127.0.0.1:4100".to_owned())
         );
         assert_eq!(websocket_base("ftp://game.example"), None);
+    }
+
+    #[test]
+    fn local_request_classification_checks_peer_and_forwarded_clients() {
+        let local: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let local_v6: SocketAddr = "[::1]:1234".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.10:1234".parse().unwrap();
+        let mut headers = HeaderMap::new();
+
+        assert!(request_is_local(local, &headers));
+        assert!(request_is_local(local_v6, &headers));
+        assert!(!request_is_local(remote, &headers));
+
+        headers.insert("x-forwarded-for", "127.0.0.1, ::1".parse().unwrap());
+        headers.insert("x-real-ip", "127.0.0.1:4567".parse().unwrap());
+        headers.insert(
+            "forwarded",
+            "for=\"[::1]\";proto=https, for=127.0.0.1".parse().unwrap(),
+        );
+        assert!(request_is_local(local, &headers));
+        assert!(!request_is_local(remote, &headers));
+
+        headers.insert("x-forwarded-for", "203.0.113.8".parse().unwrap());
+        assert!(!request_is_local(local, &headers));
+
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        headers.insert("forwarded", "for=198.51.100.9".parse().unwrap());
+        assert!(!request_is_local(local, &headers));
+
+        headers.insert("forwarded", "for=unknown".parse().unwrap());
+        assert!(!request_is_local(local, &headers));
+    }
+
+    #[test]
+    fn room_delete_detection_does_not_affect_other_proxy_requests() {
+        assert!(is_room_delete(&Method::DELETE, "/api/rooms/table"));
+        assert!(is_room_delete(&Method::DELETE, "/api/rooms/table%20one"));
+        assert!(!is_room_delete(&Method::POST, "/api/rooms/table"));
+        assert!(!is_room_delete(&Method::DELETE, "/api/rooms"));
+        assert!(!is_room_delete(&Method::DELETE, "/api/rooms/table/join"));
+        assert!(!is_room_delete(&Method::GET, "/api/rooms/table/view"));
+    }
+
+    #[test]
+    fn lobby_room_controls_are_rendered_only_for_local_requests() {
+        let rooms = vec![RoomSummary {
+            name: "Ada's <table>".into(),
+            seats: vec!["Ada".into()],
+            lifecycle: Lifecycle::Lobby,
+        }];
+        let headers = HeaderMap::new();
+        let local: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.10:1234".parse().unwrap();
+
+        let local_rows = room_rows_markup(&rooms, request_is_local(local, &headers));
+        assert!(local_rows.contains("data-delete-room"));
+        assert!(local_rows.contains("data-room=\"Ada&#39;s &lt;table&gt;\""));
+
+        let remote_rows = room_rows_markup(&rooms, request_is_local(remote, &headers));
+        assert!(!remote_rows.contains("data-delete-room"));
+        assert!(remote_rows.contains("Ada&#39;s &lt;table&gt;"));
     }
 }

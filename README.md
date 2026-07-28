@@ -52,6 +52,9 @@ A referee is optional. The third player to join starts the match automatically;
 an empty referee-password field creates and logs a generated credential for the
 optional omniscient view.
 
+Opening the lobby directly from loopback shows a `×` control for removing a
+room. Deletion is not available through remote or reverse-proxied requests.
+
 See [API.md](API.md) for protocol and visibility details and [TESTS.md](TESTS.md)
 for rule-test traceability. Bots are intentionally out of scope for v1; the
 player protocol contains no human-only operation.

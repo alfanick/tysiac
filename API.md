@@ -23,6 +23,7 @@ with CSS used to cover it.
 | `GET /health` | none | Liveness |
 | `GET /api/rooms` | none | Public room list |
 | `POST /api/rooms` | none | Create room, player password, optional referee password/config/seed |
+| `DELETE /api/rooms/{room}` | loopback client only | Permanently remove a room and its persisted state |
 | `POST /api/rooms/{room}/join` | join password or seat token | Join/reconnect; the third new player starts the match automatically |
 | `POST /api/rooms/{room}/leave` | seat token | Leave and compact seats before start |
 | `GET /api/rooms/{room}/view` | role-dependent | Full role projection |
@@ -36,6 +37,11 @@ Views use `role=observer`, or `role=player&seat=0&credential=TOKEN`, or
 The referee role is never required for play. If room creation omits its
 password or sends an empty value, the server generates a referee credential,
 returns it to the creator, and writes it to stdout with the other room secrets.
+
+Room deletion is deliberately machine-local. The web server exposes its `×`
+control only to direct loopback clients and rejects non-loopback forwarded
+addresses before the request reaches the game server. The game server performs
+its own loopback check as a second boundary.
 
 ## Commands
 

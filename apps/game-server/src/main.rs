@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     env,
+    net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -9,12 +10,12 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, State,
+        ConnectInfo, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use mille_protocol::{
@@ -55,6 +56,8 @@ struct Room {
     connections: [usize; 3],
     #[serde(skip, default)]
     connection_generation: [u64; 3],
+    #[serde(skip, default)]
+    deleted: bool,
     #[serde(skip, default = "broadcast_channel")]
     updates: broadcast::Sender<u64>,
 }
@@ -196,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/rooms", get(list_rooms).post(create_room))
+        .route("/api/rooms/{room}", delete(delete_room))
         .route("/api/rooms/{room}/join", post(join_room))
         .route("/api/rooms/{room}/leave", post(leave_room))
         .route("/api/rooms/{room}/view", get(room_view))
@@ -212,7 +216,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     eprintln!("game-server listening on http://{listen}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -239,6 +247,9 @@ async fn list_rooms(State(state): State<AppState>) -> Json<Vec<RoomSummary>> {
     let mut summaries = Vec::new();
     for room in values {
         let room = room.lock().await;
+        if room.deleted {
+            continue;
+        }
         summaries.push(RoomSummary {
             name: room.name.clone(),
             seats: room.seats.iter().map(|seat| seat.name.clone()).collect(),
@@ -294,6 +305,7 @@ async fn create_room(
         recent_commands: VecDeque::new(),
         connections: [0; 3],
         connection_generation: [0; 3],
+        deleted: false,
         updates: broadcast_channel(),
     };
     let mut rooms = state.rooms.write().await;
@@ -318,6 +330,46 @@ async fn create_room(
     Ok(Json(response))
 }
 
+async fn delete_room(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Path(room_name): Path<String>,
+) -> ApiResult<StatusCode> {
+    if !peer.ip().is_loopback() {
+        return Err(ApiFailure::forbidden(
+            "rooms can only be deleted from the local machine",
+        ));
+    }
+
+    let mut rooms = state.rooms.write().await;
+    let handle = rooms.get(&room_name).cloned().ok_or_else(room_not_found)?;
+    let mut room = handle.lock().await;
+    sqlx::query("DELETE FROM rooms WHERE name = ?1")
+        .bind(&room_name)
+        .execute(&state.db)
+        .await
+        .map_err(|error| ApiFailure::internal(format!("deleting room: {error}")))?;
+
+    room.deleted = true;
+    let player_connections = room.connections.iter().sum::<usize>();
+    let listeners = room.updates.receiver_count();
+    room.updates.send(room.revision).ok();
+    let deleted_name = room.name.clone();
+    drop(room);
+    rooms.remove(&room_name);
+    drop(rooms);
+
+    stdout_line(
+        &deleted_name,
+        "DELETED",
+        format!(
+            "deleted by local peer {peer}; notified {listeners} listener(s), including \
+             {player_connections} active player connection(s)"
+        ),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn join_room(
     State(state): State<AppState>,
     Path(room_name): Path<String>,
@@ -326,6 +378,7 @@ async fn join_room(
     validate_identifier(&input.name, "player name")?;
     let handle = find_room(&state, &room_name).await?;
     let mut room = handle.lock().await;
+    ensure_room_active(&room)?;
     if let Some((index, seat)) = room
         .seats
         .iter()
@@ -398,6 +451,7 @@ async fn leave_room(
 ) -> ApiResult<StatusCode> {
     let handle = find_room(&state, &room_name).await?;
     let mut room = handle.lock().await;
+    ensure_room_active(&room)?;
     if room.lifecycle != Lifecycle::Lobby {
         return Err(ApiFailure::conflict(
             "match_started",
@@ -429,6 +483,7 @@ async fn room_view(
 ) -> ApiResult<Json<View>> {
     let handle = find_room(&state, &room_name).await?;
     let room = handle.lock().await;
+    ensure_room_active(&room)?;
     Ok(Json(make_view(
         &room,
         query.role.as_deref(),
@@ -444,6 +499,7 @@ async fn room_action(
 ) -> ApiResult<Json<ServerMessage>> {
     let handle = find_room(&state, &room_name).await?;
     let mut room = handle.lock().await;
+    ensure_room_active(&room)?;
     authenticate_seat(&room, input.seat, &input.token)?;
     if room.connections[input.seat.index()] > 0 {
         return Err(ApiFailure::conflict(
@@ -470,6 +526,7 @@ async fn room_admin(
 ) -> ApiResult<Json<ServerMessage>> {
     let handle = find_room(&state, &room_name).await?;
     let mut room = handle.lock().await;
+    ensure_room_active(&room)?;
     if room.referee_password != input.referee_password {
         return Err(ApiFailure::unauthorized("wrong referee password"));
     }
@@ -677,6 +734,7 @@ async fn room_ws(
     let credential = query.credential;
     {
         let room = handle.lock().await;
+        ensure_room_active(&room)?;
         make_view(&room, Some(&role), query.seat, credential.as_deref())?;
     }
     Ok(upgrade.on_upgrade(move |socket| websocket(socket, state, handle, role, seat, credential)))
@@ -693,6 +751,9 @@ async fn websocket(
     let (mut sender, mut receiver) = socket.split();
     let (mut updates, generation) = {
         let mut room = handle.lock().await;
+        if room.deleted {
+            return;
+        }
         let generation = if role == "player" {
             let Some(seat) = seat else { return };
             room.connections[seat.index()] += 1;
@@ -726,8 +787,17 @@ async fn websocket(
     loop {
         tokio::select! {
             update = updates.recv() => {
-                if update.is_err() { continue; }
+                match update {
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
                 let room = handle.lock().await;
+                if room.deleted {
+                    drop(room);
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
                 let Ok(view) = make_view(&room, Some(&role), seat.map(|seat| seat.0), credential.as_deref()) else { break };
                 if sender.send(Message::Text(serde_json::to_string(&ServerMessage::Snapshot(view)).unwrap().into())).await.is_err() {
                     break;
@@ -741,7 +811,9 @@ async fn websocket(
                     Ok(ClientMessage::Act { command_id, expected_revision, action }) if role == "player" => {
                         let Some(actor) = seat else { break };
                         let mut room = handle.lock().await;
-                        if room.connection_generation[actor.index()] != generation {
+                        if room.deleted {
+                            break;
+                        } else if room.connection_generation[actor.index()] != generation {
                             ServerMessage::Error(ApiError { code: "superseded_connection".into(), message: "a newer player connection controls this seat".into(), current_revision: Some(room.revision) })
                         } else if let Some(token) = credential.as_deref() {
                             match authenticate_seat(&room, actor, token) {
@@ -768,7 +840,9 @@ async fn websocket(
     {
         let mut room = handle.lock().await;
         room.connections[seat.index()] = room.connections[seat.index()].saturating_sub(1);
-        room.updates.send(room.revision).ok();
+        if !room.deleted {
+            room.updates.send(room.revision).ok();
+        }
     }
 }
 
@@ -823,7 +897,10 @@ fn schedule_next_round(state: AppState, room_name: String, expected_revision: u6
             return;
         };
         let mut room = handle.lock().await;
-        if room.revision != expected_revision || room.lifecycle != Lifecycle::Running {
+        if room.deleted
+            || room.revision != expected_revision
+            || room.lifecycle != Lifecycle::Running
+        {
             return;
         }
         let base_seed = room.base_seed;
@@ -884,7 +961,7 @@ fn schedule_presentation(state: AppState, room_name: String, expected_revision: 
                 return;
             };
             let mut room = handle.lock().await;
-            if room.revision != expected_revision {
+            if room.deleted || room.revision != expected_revision {
                 return;
             }
             update_presentation(&mut room);
@@ -1069,6 +1146,7 @@ fn update_presentation(room: &mut Room) {
 }
 
 async fn persist(db: &SqlitePool, room: &Room) -> ApiResult<()> {
+    ensure_room_active(room)?;
     let json = serde_json::to_string(room)
         .map_err(|error| ApiFailure::internal(format!("serializing room: {error}")))?;
     sqlx::query(
@@ -1091,7 +1169,19 @@ async fn find_room(state: &AppState, name: &str) -> ApiResult<Arc<Mutex<Room>>> 
         .await
         .get(name)
         .cloned()
-        .ok_or_else(|| ApiFailure::not_found("room_not_found", "room does not exist"))
+        .ok_or_else(room_not_found)
+}
+
+fn ensure_room_active(room: &Room) -> ApiResult<()> {
+    if room.deleted {
+        Err(room_not_found())
+    } else {
+        Ok(())
+    }
+}
+
+fn room_not_found() -> ApiFailure {
+    ApiFailure::not_found("room_not_found", "room does not exist")
 }
 
 fn join_response(room: &str, index: usize, seat: &SeatIdentity) -> JoinedRoom {
@@ -1263,6 +1353,10 @@ impl ApiFailure {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", message, None)
     }
 
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", message, None)
+    }
+
     fn not_found(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, code, message, None)
     }
@@ -1334,6 +1428,7 @@ mod tests {
             recent_commands: VecDeque::new(),
             connections: [0; 3],
             connection_generation: [0; 3],
+            deleted: false,
             updates: broadcast_channel(),
         }
     }
@@ -1363,6 +1458,77 @@ mod tests {
         .await
         .unwrap();
         joined
+    }
+
+    #[tokio::test]
+    async fn room_deletion_accepts_ipv4_and_ipv6_loopback_and_removes_all_state() {
+        for peer in ["127.0.0.1:12345", "[::1]:12345"] {
+            let state = lobby_state().await;
+            let handle = find_room(&state, "test-table").await.unwrap();
+            let mut updates = handle.lock().await.updates.subscribe();
+
+            let status = delete_room(
+                ConnectInfo(peer.parse().unwrap()),
+                State(state.clone()),
+                Path("test-table".into()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), updates.recv())
+                    .await
+                    .is_ok()
+            );
+            assert!(handle.lock().await.deleted);
+            assert!(state.rooms.read().await.get("test-table").is_none());
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE name = ?1")
+                .bind("test-table")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn room_deletion_rejects_non_loopback_peers_without_changing_state() {
+        let state = lobby_state().await;
+
+        let error = delete_room(
+            ConnectInfo("192.0.2.1:12345".parse().unwrap()),
+            State(state.clone()),
+            Path("test-table".into()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "forbidden");
+        assert!(state.rooms.read().await.contains_key("test-table"));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE name = ?1")
+            .bind("test-table")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_room_returns_not_found() {
+        let state = test_state().await;
+
+        let error = delete_room(
+            ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+            State(state),
+            Path("missing".into()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.body.code, "room_not_found");
     }
 
     #[test]

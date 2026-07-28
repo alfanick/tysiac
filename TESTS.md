@@ -20,6 +20,7 @@ with `cargo test --workspace`.
 | 900 lock, negative unlock path, target priority and ties | `locked_defender_cannot_gain_but_can_lose_as_contractor`, `successful_contractor_has_winner_priority_and_target_ties_continue` |
 | Observer/player/referee secrecy | all `mille-protocol` tests and `observer_projection_omits_base_seed_and_hidden_hands` |
 | SQLite restore, credentials/tokens, revisions/idempotency, seed parsing | all `game-server` tests |
+| Loopback-only room deletion, registry/SQLite removal, proxy forwarding checks | deletion tests in both server apps |
 | HTML4 observer card backs and escaping | both `web-server` tests |
 
 The live smoke test used both running processes to create a seeded room, join
