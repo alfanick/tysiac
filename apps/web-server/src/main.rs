@@ -316,7 +316,7 @@ async fn observer(State(state): State<Arc<AppState>>, Path(room): Path<String>) 
     Html(format!(
         "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">
         <html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">
-        <meta http-equiv=\"refresh\" content=\"2\"><title>{title}</title><base href=\"../\">
+        <noscript><meta http-equiv=\"refresh\" content=\"2\"></noscript><title>{title}</title><base href=\"../\"><link rel=\"icon\" href=\"static/favicon.svg\" type=\"image/svg+xml\">
         <link rel=\"stylesheet\" href=\"static/observer.css\" type=\"text/css\"></head>
         <body data-page=\"observer\" data-room=\"{room}\" data-game-api=\"{api}\">
         <div id=\"table\">{body}</div>
@@ -480,7 +480,7 @@ fn modern_head(title: &str, base_href: &str) -> String {
         ""
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><title>{}</title><base id=\"app-base\" href=\"{}\">{lobby_base_fix}<link rel=\"stylesheet\" href=\"static/app.css\"></head>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><title>{}</title><base id=\"app-base\" href=\"{}\">{lobby_base_fix}<link rel=\"icon\" href=\"static/favicon.svg\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"static/app.css\"></head>",
         escape(title),
         escape_attr(base_href),
     )

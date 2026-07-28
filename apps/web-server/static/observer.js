@@ -68,15 +68,10 @@
     };
   }
 
-  // IE6 and similarly limited TV browsers keep the HTML meta refresh. Modern
-  // browsers remove it and replace only the table markup, preserving anything
-  // already typed into the join form.
+  // Modern browsers replace only the table markup, preserving anything already
+  // typed into the join form. IE6 and similarly limited TV browsers reload on a
+  // timer; browsers without JavaScript use the <noscript> meta refresh.
   if (window.WebSocket && window.fetch && window.DOMParser && document.querySelectorAll) {
-    var metas = document.querySelectorAll('meta[http-equiv="refresh"]');
-    for (var i = 0; i < metas.length; i += 1) {
-      metas[i].parentNode.removeChild(metas[i]);
-    }
-
     var refreshPending = false;
     function refreshTable() {
       if (refreshPending) return;
@@ -118,5 +113,9 @@
       };
     }
     connect();
+  } else {
+    window.setTimeout(function () {
+      window.location.reload();
+    }, 2000);
   }
 }());
