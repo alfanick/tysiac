@@ -1,0 +1,16 @@
+[package]
+name = "mille-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cards = { package = "mille-cards", path = "../cards" }
+serde.workspace = true
+tysiac = { path = "../tysiac" }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

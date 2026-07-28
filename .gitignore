@@ -1,0 +1,7 @@
+/target/
+/dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+
