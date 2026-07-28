@@ -70,5 +70,9 @@ connections remain useful for reading snapshots but action attempts return
   history including private transfers.
 
 Public match-end history publishes each derived round seed and complete deal
-order. The base seed remains referee-only so a future rematch cannot be
+order. If a seeded deal is rejected because one initial hand contains all four
+nines, deterministic domain-separated retry shuffles are used. The referee
+audit records the accepted order and how many four-nine deals were rejected;
+players see additional shuffling time, but the rejected private card orders are
+not published. The base seed remains referee-only so a future rematch cannot be
 predicted.

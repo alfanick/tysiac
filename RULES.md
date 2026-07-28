@@ -20,6 +20,9 @@ normally begins at 900.
 ### Deal and auction
 
 Deal seven private cards to each player and three face-down cards to the talon.
+If any initial seven-card hand contains all four nines, the deal is void:
+gather all 24 cards, reshuffle, and deal again. Repeat before the auction until
+no player holds all four nines.
 The player after the dealer must open at 100. In circular order, an active
 player raises by exactly 10 or passes permanently. The last active bidder
 becomes the contractor.
@@ -96,6 +99,9 @@ Die Sperre beginnt normalerweise bei 900.
 ### Geben und Reizen
 
 Jede Person erhält sieben verdeckte Karten, drei weitere bilden den Talon. Die
+Verteilung ist ungültig, wenn eine Person in diesen sieben Karten alle vier
+Neunen hält: Alle 24 Karten werden eingesammelt, neu gemischt und erneut
+gegeben. Das wird vor dem Reizen wiederholt, bis niemand alle vier Neunen hält.
 Person nach dem Geber muss mit 100 eröffnen. Danach erhöht man im Kreis genau um
 10 oder passt endgültig. Die letzte aktive Person wird Alleinspieler.
 
@@ -169,9 +175,12 @@ zaczyna się standardowo od 900.
 
 ### Rozdanie i licytacja
 
-Każdy dostaje siedem zakrytych kart, a trzy tworzą zakryty musik. Gracz po
-rozdającym musi rozpocząć od 100. Dalej aktywny gracz podbija dokładnie o 10
-albo pasuje do końca licytacji. Ostatni aktywny zostaje grającym.
+Każdy dostaje siedem zakrytych kart, a trzy tworzą zakryty musik. Jeżeli
+którykolwiek gracz ma w tych siedmiu kartach wszystkie cztery dziewiątki,
+rozdanie jest nieważne: zbiera się wszystkie 24 karty, ponownie tasuje i
+rozdaje. Powtarza się to przed licytacją, aż nikt nie ma czterech dziewiątek.
+Gracz po rozdającym musi rozpocząć od 100. Dalej aktywny gracz podbija dokładnie
+o 10 albo pasuje do końca licytacji. Ostatni aktywny zostaje grającym.
 
 Do 120 nie trzeba meldunku. Wyżej limit wynosi `120 +` wartości wszystkich
 meldunków trzymanych w ręce. Po nieudowodnionej ofercie każdy przeciwnik—także

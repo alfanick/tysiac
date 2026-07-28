@@ -146,6 +146,8 @@ pub struct RoundAudit {
     pub round_index: u64,
     pub derived_seed: u64,
     pub deal_order: Vec<Card>,
+    #[serde(default)]
+    pub four_nines_reshuffles: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -432,6 +434,23 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == tysiac::EventKind::Transfer)
         );
+    }
+
+    #[test]
+    fn old_round_audit_json_defaults_four_nines_reshuffles_to_zero() {
+        let audit: RoundAudit = serde_json::from_value(serde_json::json!({
+            "match_index": 2,
+            "round_index": 3,
+            "derived_seed": 42,
+            "deal_order": []
+        }))
+        .unwrap();
+
+        assert_eq!(audit.match_index, 2);
+        assert_eq!(audit.round_index, 3);
+        assert_eq!(audit.derived_seed, 42);
+        assert!(audit.deal_order.is_empty());
+        assert_eq!(audit.four_nines_reshuffles, 0);
     }
 
     fn rank_name(rank: cards::Rank) -> &'static str {

@@ -85,6 +85,11 @@ enum PresentationStage {
     Dealing,
 }
 
+const INITIAL_SHUFFLE_PRESENTATION_MS: u64 = 2_000;
+const DEAL_PRESENTATION_MS: u64 = 6_000;
+const FOUR_NINES_RESHUFFLE_PRESENTATION_MS: u64 = 2_000;
+const MAX_PRESENTED_FOUR_NINES_RESHUFFLES: u64 = 10;
+
 fn broadcast_channel() -> broadcast::Sender<u64> {
     broadcast::channel(64).0
 }
@@ -607,39 +612,83 @@ fn start_match(room: &mut Room) -> ApiResult<()> {
         .expect("three seats");
     let mut game = Match::new(names, room.config.clone(), dealer);
     game.match_index = room.match_index;
-    let order = game
-        .deal_seeded(seed)
+    let deal = game
+        .deal_seeded_with_report(seed)
         .map_err(|error| rule_failure(&error))?;
-    room.round_audits.clear();
-    room.round_audits.push(RoundAudit {
+    let audit = RoundAudit {
         match_index: room.match_index,
         round_index: 0,
         derived_seed: seed,
-        deal_order: order.clone(),
-    });
+        deal_order: deal.order,
+        four_nines_reshuffles: deal.four_nines_reshuffles,
+    };
+    let shuffle_detail = shuffle_audit_detail(&audit);
+    room.round_audits.clear();
+    room.presentation = deal_presentation(now_ms(), audit.four_nines_reshuffles);
+    room.round_audits.push(audit);
     room.game = Some(game);
     room.lifecycle = Lifecycle::Running;
-    let now = now_ms();
-    room.presentation = Presentation {
+    stdout_line(&room.name, "SHUFFLE", shuffle_detail);
+    Ok(())
+}
+
+fn deal_presentation(now: u64, four_nines_reshuffles: u64) -> Presentation {
+    let reshuffle_delay = four_nines_reshuffles
+        .min(MAX_PRESENTED_FOUR_NINES_RESHUFFLES)
+        .saturating_mul(FOUR_NINES_RESHUFFLE_PRESENTATION_MS);
+    let deal_started_ms = now
+        .saturating_add(INITIAL_SHUFFLE_PRESENTATION_MS)
+        .saturating_add(reshuffle_delay);
+    Presentation {
         stage: PresentationStage::Shuffling,
         visible_deal_cards: 0,
-        gate_until_ms: now + 8_000,
-        deal_started_ms: now + 2_000,
+        gate_until_ms: deal_started_ms.saturating_add(DEAL_PRESENTATION_MS),
+        deal_started_ms,
+    }
+}
+
+fn shuffle_audit_detail(audit: &RoundAudit) -> String {
+    let reshuffle_reason = if audit.four_nines_reshuffles == 0 {
+        "none"
+    } else {
+        "initial_hand_contained_all_four_nines"
     };
-    stdout_line(
-        &room.name,
-        "SHUFFLE",
-        format!(
-            "match={} round=0 derived_seed={seed} deal_order={}",
-            room.match_index,
-            order
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" ")
+    format!(
+        "match={} round={} derived_seed={} four_nines_reshuffles={} \
+         reshuffle_reason={reshuffle_reason} accepted_deal_order={}",
+        audit.match_index,
+        audit.round_index,
+        audit.derived_seed,
+        audit.four_nines_reshuffles,
+        audit
+            .deal_order
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+fn published_round_audit_message(audit: &RoundAudit) -> String {
+    let reshuffle_summary = match audit.four_nines_reshuffles {
+        0 => "no all-four-nines reshuffle was required".to_owned(),
+        1 => "1 deal was reshuffled because an initial hand contained all four nines".to_owned(),
+        count => format!(
+            "{count} deals were reshuffled because an initial hand contained all four nines"
         ),
-    );
-    Ok(())
+    };
+    format!(
+        "published match {} round {}: seed {}, {reshuffle_summary}; accepted deal {}",
+        audit.match_index,
+        audit.round_index,
+        audit.derived_seed,
+        audit
+            .deal_order
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 fn round_finished(game: &Match) -> bool {
@@ -913,40 +962,25 @@ fn schedule_next_round(state: AppState, room_name: String, expected_revision: u6
         }
         let round_index = game.round_index;
         let seed = Match::derive_round_seed(base_seed, match_index, round_index);
-        let Ok(order) = game.deal_seeded(seed) else {
+        let Ok(deal) = game.deal_seeded_with_report(seed) else {
             return;
         };
-        room.round_audits.push(RoundAudit {
+        let audit = RoundAudit {
             match_index,
             round_index,
             derived_seed: seed,
-            deal_order: order.clone(),
-        });
-        let now = now_ms();
-        room.presentation = Presentation {
-            stage: PresentationStage::Shuffling,
-            visible_deal_cards: 0,
-            gate_until_ms: now + 8_000,
-            deal_started_ms: now + 2_000,
+            deal_order: deal.order,
+            four_nines_reshuffles: deal.four_nines_reshuffles,
         };
+        let shuffle_detail = shuffle_audit_detail(&audit);
+        room.presentation = deal_presentation(now_ms(), audit.four_nines_reshuffles);
+        room.round_audits.push(audit);
         room.revision += 1;
         if persist(&state.db, &room).await.is_err() {
             error!("failed to persist automatic round");
             return;
         }
-        stdout_line(
-            &room.name,
-            "SHUFFLE",
-            format!(
-                "match={} round={round_index} derived_seed={seed} deal_order={}",
-                room.match_index,
-                order
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
-        );
+        stdout_line(&room.name, "SHUFFLE", shuffle_detail);
         stdout_full(&room, "STATE");
         room.updates.send(room.revision).ok();
         schedule_presentation(state.clone(), room.name.clone(), room.revision);
@@ -981,18 +1015,7 @@ fn publish_round_audits(room: &mut Room) {
     for audit in &room.round_audits {
         game.events.push(tysiac::GameEvent {
             kind: tysiac::EventKind::Deal,
-            message: format!(
-                "published match {} round {}: seed {}, deal {}",
-                audit.match_index,
-                audit.round_index,
-                audit.derived_seed,
-                audit
-                    .deal_order
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
+            message: published_round_audit_message(audit),
         });
     }
 }
@@ -1547,13 +1570,57 @@ mod tests {
         start_match(&mut second).unwrap();
         assert_eq!(first.round_audits, second.round_audits);
         assert_eq!(first.round_audits[0].deal_order.len(), 24);
+        assert_eq!(first.round_audits[0].four_nines_reshuffles, 0);
         assert_eq!(first.presentation.stage, PresentationStage::Shuffling);
         assert!(first.presentation.gate_until_ms >= first.presentation.deal_started_ms + 6_000);
+        let zero_retry = deal_presentation(100, 0);
+        assert_eq!(zero_retry.deal_started_ms, 2_100);
+        assert_eq!(zero_retry.gate_until_ms, 8_100);
         let MatchPhase::Round(round) = &first.game.as_ref().unwrap().phase else {
             panic!()
         };
         assert_eq!(round.hands.each_ref().map(Vec::len), [7, 7, 7]);
         assert_eq!(round.talon.len(), 3);
+    }
+
+    #[test]
+    fn retry_is_audited_published_and_given_extra_presentation_time() {
+        let mut room = room();
+        room.base_seed = 218;
+        start_match(&mut room).unwrap();
+
+        let audit = room.round_audits[0].clone();
+        assert_eq!(audit.derived_seed, 8_934_752_883_078_774_011);
+        assert_eq!(audit.four_nines_reshuffles, 1);
+        assert_eq!(audit.deal_order.len(), 24);
+        assert_eq!(
+            room.game.as_ref().unwrap().events[0].message,
+            "1 invalid all-four-nines deal was reshuffled"
+        );
+
+        let one_retry = deal_presentation(100, audit.four_nines_reshuffles);
+        assert_eq!(one_retry.deal_started_ms, 4_100);
+        assert_eq!(one_retry.gate_until_ms, 10_100);
+        let saturated = deal_presentation(u64::MAX - 1_000, u64::MAX);
+        assert_eq!(saturated.deal_started_ms, u64::MAX);
+        assert_eq!(saturated.gate_until_ms, u64::MAX);
+
+        let stdout = shuffle_audit_detail(&audit);
+        assert!(stdout.contains("four_nines_reshuffles=1"));
+        assert!(stdout.contains("reshuffle_reason=initial_hand_contained_all_four_nines"));
+        assert!(stdout.contains("accepted_deal_order="));
+
+        let published = published_round_audit_message(&audit);
+        publish_round_audits(&mut room);
+        assert_eq!(
+            room.game.as_ref().unwrap().events.last().unwrap().message,
+            published
+        );
+        assert!(
+            published
+                .contains("1 deal was reshuffled because an initial hand contained all four nines")
+        );
+        assert!(published.contains("accepted deal"));
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ with `cargo test --workspace`.
 | Rule or boundary | Test coverage |
 |---|---|
 | 24-card composition, rank order, values, 120 total | `scoring_table_is_exact_and_each_suit_has_thirty`, card-deck tests |
-| Stable seeded shuffle and independent match/round seeds | `seeded_shuffle_is_reproducible_and_conservative`, `seed_has_a_golden_prefix`, `seed_derivation_separates_matches_and_rounds` |
+| Stable seeded shuffle, deterministic four-nine redeal, audited retry count, independent match/round seeds | `seeded_shuffle_is_reproducible_and_conservative`, `seed_has_a_golden_prefix`, `seeded_deal_retries_a_first_shuffle_with_all_four_nines`, `seeded_deal_can_retry_more_than_once`, `seeded_redeal_is_reproducible_from_the_original_round_seed`, `accepted_seeded_deals_never_give_one_player_all_nines`, `valid_seed_keeps_the_legacy_golden_order`, `old_round_audit_json_defaults_four_nines_reshuffles_to_zero`, `retry_is_audited_published_and_given_extra_presentation_time`, `seed_derivation_separates_matches_and_rounds` |
 | Interleaved 7+7+7+3 deal and forced 100 opener | `interleaved_deal_places_three_specific_talon_cards` |
 | Exact +10 bidding, turn order, permanent pass, hand ceiling | `auction_is_exact_steps_and_pass_is_permanent`, `bids_above_support_are_rejected` |
 | Sequential proof, passed-player challenge, smallest held subset | `proof_is_sequential_and_smallest_sufficient`, `passed_opponent_still_gets_sequential_proof_choice` |

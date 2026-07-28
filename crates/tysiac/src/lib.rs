@@ -289,6 +289,12 @@ pub struct ApplyOutcome {
     pub events: Vec<GameEvent>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeededDeal {
+    pub order: Vec<Card>,
+    pub four_nines_reshuffles: u64,
+}
+
 impl Match {
     #[must_use]
     pub fn new(names: [String; PLAYER_COUNT], config: Config, dealer: Seat) -> Self {
@@ -330,22 +336,77 @@ impl Match {
         u64::from_le_bytes([first, second, third, fourth, fifth, sixth, seventh, eighth])
     }
 
-    /// Shuffles and deals the next round from a stable seed.
+    /// Shuffles and deals the next round from a stable seed, returning the
+    /// accepted card order.
+    ///
+    /// A shuffle that gives one player all four nines in their initial hand is
+    /// discarded and retried from a deterministic, domain-separated seed. The
+    /// returned order is always the accepted shuffle, while [`Round::seed`]
+    /// remains the supplied round seed.
     ///
     /// # Errors
     ///
     /// Returns [`RuleError::CannotDeal`] unless the match is waiting for a deal.
     pub fn deal_seeded(&mut self, seed: u64) -> Result<Vec<Card>, RuleError> {
-        let mut deck = cards::Deck::from_cards(game_deck()).map_err(|_| RuleError::InvalidDeck)?;
-        let mut expanded_seed = [0_u8; 32];
-        expanded_seed[..8].copy_from_slice(&seed.to_le_bytes());
-        deck.shuffle_with_seed(expanded_seed);
-        let order = deck.cards().to_vec();
-        self.deal_ordered(seed, order.clone())?;
-        Ok(order)
+        self.deal_seeded_with_report(seed).map(|deal| deal.order)
+    }
+
+    /// Shuffles and deals the next round, reporting any all-four-nines
+    /// reshuffles.
+    ///
+    /// Rejected shuffles do not mutate the match or emit events. When at least
+    /// one shuffle is rejected, one [`EventKind::Deal`] event reports the count
+    /// immediately before the accepted deal and auction events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuleError::CannotDeal`] unless the match is waiting for a deal,
+    /// or in the unreachable-in-practice event that the retry counter is
+    /// exhausted.
+    pub fn deal_seeded_with_report(&mut self, seed: u64) -> Result<SeededDeal, RuleError> {
+        if !matches!(self.phase, MatchPhase::WaitingForDeal) {
+            return Err(RuleError::CannotDeal);
+        }
+
+        let mut four_nines_reshuffles = 0_u64;
+        loop {
+            let mut deck =
+                cards::Deck::from_cards(game_deck()).map_err(|_| RuleError::InvalidDeck)?;
+            deck.shuffle_with_seed(deal_shuffle_seed(seed, four_nines_reshuffles));
+            let order = deck.cards().to_vec();
+            let (hands, _) = distribute_deal(&order);
+            if hands.iter().any(|hand| has_all_nines(hand)) {
+                four_nines_reshuffles = four_nines_reshuffles
+                    .checked_add(1)
+                    .ok_or(RuleError::CannotDeal)?;
+                continue;
+            }
+            if four_nines_reshuffles > 0 {
+                let deal_word = if four_nines_reshuffles == 1 {
+                    "deal was"
+                } else {
+                    "deals were"
+                };
+                self.push(
+                    EventKind::Deal,
+                    format!(
+                        "{four_nines_reshuffles} invalid all-four-nines {deal_word} reshuffled"
+                    ),
+                );
+            }
+            self.deal_ordered(seed, order.clone())?;
+            return Ok(SeededDeal {
+                order,
+                four_nines_reshuffles,
+            });
+        }
     }
 
     /// Deals an explicitly ordered 24-card game deck.
+    ///
+    /// This is a setup and replay escape hatch: the supplied order is dealt
+    /// exactly as provided, without applying the seeded all-four-nines
+    /// reshuffle policy.
     ///
     /// # Errors
     ///
@@ -358,28 +419,7 @@ impl Match {
         }
         let deck = deck.as_ref();
         validate_game_deck(deck)?;
-        let mut hands: [Vec<Card>; PLAYER_COUNT] = std::array::from_fn(|_| Vec::new());
-        let mut talon = Vec::new();
-        let mut cursor = 0;
-
-        // Three circuits: seat 1, seat 2, one talon card, seat 3.
-        for _ in 0..3 {
-            hands[0].push(deck[cursor]);
-            cursor += 1;
-            hands[1].push(deck[cursor]);
-            cursor += 1;
-            talon.push(deck[cursor]);
-            cursor += 1;
-            hands[2].push(deck[cursor]);
-            cursor += 1;
-        }
-        // Four ordinary circuits.
-        for _ in 0..4 {
-            for hand in &mut hands {
-                hand.push(deck[cursor]);
-                cursor += 1;
-            }
-        }
+        let (mut hands, talon) = distribute_deal(deck);
         for hand in &mut hands {
             sort_hand(hand);
         }
@@ -1393,6 +1433,56 @@ fn remove_card(hand: &mut Vec<Card>, card: Card) -> Result<(), RuleError> {
     Ok(())
 }
 
+fn deal_shuffle_seed(seed: u64, attempt: u64) -> [u8; 32] {
+    if attempt == 0 {
+        let mut expanded_seed = [0_u8; 32];
+        expanded_seed[..8].copy_from_slice(&seed.to_le_bytes());
+        return expanded_seed;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mille/deal-retry-seed/v1");
+    hasher.update(&seed.to_le_bytes());
+    hasher.update(&attempt.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn distribute_deal(deck: &[Card]) -> ([Vec<Card>; PLAYER_COUNT], Vec<Card>) {
+    let mut hands: [Vec<Card>; PLAYER_COUNT] = std::array::from_fn(|_| Vec::new());
+    let mut talon = Vec::new();
+    let mut cursor = 0;
+
+    // Three circuits: seat 1, seat 2, one talon card, seat 3.
+    for _ in 0..3 {
+        hands[0].push(deck[cursor]);
+        cursor += 1;
+        hands[1].push(deck[cursor]);
+        cursor += 1;
+        talon.push(deck[cursor]);
+        cursor += 1;
+        hands[2].push(deck[cursor]);
+        cursor += 1;
+    }
+    // Four ordinary circuits.
+    for _ in 0..4 {
+        for hand in &mut hands {
+            hand.push(deck[cursor]);
+            cursor += 1;
+        }
+    }
+
+    (hands, talon)
+}
+
+fn has_all_nines(hand: &[Card]) -> bool {
+    Suit::ALL.into_iter().all(|suit| {
+        hand.contains(&Card {
+            rank: Rank::Nine,
+            suit,
+        })
+    })
+}
+
 fn sort_hand(hand: &mut [Card]) {
     hand.sort_by_key(|card| (suit_order(card.suit), game_rank_strength(card.rank)));
 }
@@ -1429,6 +1519,19 @@ mod tests {
             panic!("test expected an active round")
         };
         round
+    }
+
+    fn shuffled_order(seed: u64, attempt: u64) -> Vec<Card> {
+        let mut deck = cards::Deck::from_cards(game_deck()).unwrap();
+        deck.shuffle_with_seed(deal_shuffle_seed(seed, attempt));
+        deck.cards().to_vec()
+    }
+
+    fn order_has_forbidden_hand(order: &[Card]) -> bool {
+        distribute_deal(order)
+            .0
+            .iter()
+            .any(|hand| has_all_nines(hand))
     }
 
     #[test]
@@ -1701,6 +1804,149 @@ mod tests {
         assert_eq!(a, Match::derive_round_seed(42, 0, 0));
         assert_ne!(a, Match::derive_round_seed(42, 0, 1));
         assert_ne!(a, Match::derive_round_seed(42, 1, 0));
+    }
+
+    #[test]
+    fn seeded_deal_retries_a_first_shuffle_with_all_four_nines() {
+        let rejected = shuffled_order(62, 0);
+        let (rejected_hands, _) = distribute_deal(&rejected);
+        assert!(has_all_nines(&rejected_hands[Seat::ONE.index()]));
+
+        let mut game = Match::new(names(), Config::default(), Seat::ONE);
+        let SeededDeal {
+            order: accepted,
+            four_nines_reshuffles,
+        } = game.deal_seeded_with_report(62).unwrap();
+        assert_eq!(four_nines_reshuffles, 1);
+        assert_eq!(
+            accepted,
+            vec![
+                card(Rank::Nine, Suit::Clubs),
+                card(Rank::Ace, Suit::Diamonds),
+                card(Rank::Queen, Suit::Hearts),
+                card(Rank::Ten, Suit::Spades),
+                card(Rank::Ten, Suit::Hearts),
+                card(Rank::Ace, Suit::Clubs),
+                card(Rank::King, Suit::Spades),
+                card(Rank::Jack, Suit::Diamonds),
+                card(Rank::Jack, Suit::Clubs),
+                card(Rank::Nine, Suit::Spades),
+                card(Rank::Ace, Suit::Spades),
+                card(Rank::Ace, Suit::Hearts),
+                card(Rank::Jack, Suit::Hearts),
+                card(Rank::Jack, Suit::Spades),
+                card(Rank::King, Suit::Diamonds),
+                card(Rank::Nine, Suit::Hearts),
+                card(Rank::King, Suit::Clubs),
+                card(Rank::Queen, Suit::Clubs),
+                card(Rank::Queen, Suit::Spades),
+                card(Rank::Nine, Suit::Diamonds),
+                card(Rank::Queen, Suit::Diamonds),
+                card(Rank::Ten, Suit::Clubs),
+                card(Rank::Ten, Suit::Diamonds),
+                card(Rank::King, Suit::Hearts),
+            ]
+        );
+        assert_ne!(accepted, rejected);
+        assert_eq!(
+            game.events,
+            [
+                GameEvent {
+                    kind: EventKind::Deal,
+                    message: "1 invalid all-four-nines deal was reshuffled".into(),
+                },
+                GameEvent {
+                    kind: EventKind::Deal,
+                    message: "round dealt; dealer is seat 1".into(),
+                },
+                GameEvent {
+                    kind: EventKind::Auction,
+                    message: "seat 2 opens at 100".into(),
+                },
+            ]
+        );
+
+        let round = active_round(&game);
+        assert_eq!(round.seed, 62);
+        assert!(!round.hands.iter().any(|hand| has_all_nines(hand)));
+
+        let accepted_cards = accepted.iter().copied().collect::<BTreeSet<_>>();
+        let round_cards = round
+            .hands
+            .iter()
+            .flatten()
+            .chain(&round.talon)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(accepted.len(), 24);
+        assert_eq!(accepted_cards, game_deck().into_iter().collect());
+        assert_eq!(round_cards, accepted_cards);
+    }
+
+    #[test]
+    fn seeded_deal_can_retry_more_than_once() {
+        assert!(order_has_forbidden_hand(&shuffled_order(9_773, 0)));
+        assert!(order_has_forbidden_hand(&shuffled_order(9_773, 1)));
+        assert!(!order_has_forbidden_hand(&shuffled_order(9_773, 2)));
+
+        let mut game = Match::new(names(), Config::default(), Seat::ONE);
+        let report = game.deal_seeded_with_report(9_773).unwrap();
+        assert_eq!(report.four_nines_reshuffles, 2);
+        assert_eq!(report.order, shuffled_order(9_773, 2));
+        assert_eq!(
+            game.events.first(),
+            Some(&GameEvent {
+                kind: EventKind::Deal,
+                message: "2 invalid all-four-nines deals were reshuffled".into(),
+            })
+        );
+        assert_eq!(game.events.len(), 3);
+    }
+
+    #[test]
+    fn seeded_redeal_is_reproducible_from_the_original_round_seed() {
+        let mut first = Match::new(names(), Config::default(), Seat::ONE);
+        let mut second = Match::new(names(), Config::default(), Seat::ONE);
+        let first_order = first.deal_seeded(9_773).unwrap();
+        let second_order = second.deal_seeded(9_773).unwrap();
+
+        assert_eq!(first_order, second_order);
+        assert_eq!(first, second);
+        assert_eq!(active_round(&first).seed, 9_773);
+    }
+
+    #[test]
+    fn accepted_seeded_deals_never_give_one_player_all_nines() {
+        for seed in 0..1_000 {
+            let mut game = Match::new(names(), Config::default(), Seat::ONE);
+            let accepted = game.deal_seeded(seed).unwrap();
+            assert!(!order_has_forbidden_hand(&accepted), "seed {seed}");
+            assert!(
+                !active_round(&game)
+                    .hands
+                    .iter()
+                    .any(|hand| has_all_nines(hand)),
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_seed_keeps_the_legacy_golden_order() {
+        let mut game = Match::new(names(), Config::default(), Seat::ONE);
+        let labels = game
+            .deal_seeded(0)
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "K♦", "K♠", "9♥", "J♣", "Q♠", "A♥", "9♠", "K♥", "10♣", "A♠", "J♦", "J♥", "9♦",
+                "10♥", "Q♦", "A♦", "10♠", "10♦", "J♠", "A♣", "Q♥", "9♣", "Q♣", "K♣",
+            ]
+        );
     }
 
     #[test]
